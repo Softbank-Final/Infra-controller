@@ -10,10 +10,10 @@ const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 const PORT = 8080;
-const VERSION = "v1.2 (Production Ready)";
+const VERSION = "v2.0 (Secured Edition)";
 
-// [Init] 필수 환경변수 검증
-const REQUIRED_ENV = ['AWS_REGION', 'BUCKET_NAME', 'TABLE_NAME', 'SQS_URL', 'REDIS_HOST'];
+// 필수 환경변수 검증 (API Key 추가됨)
+const REQUIRED_ENV = ['AWS_REGION', 'BUCKET_NAME', 'TABLE_NAME', 'SQS_URL', 'REDIS_HOST', 'NANOGRID_API_KEY'];
 const missingEnv = REQUIRED_ENV.filter(key => !process.env[key]);
 if (missingEnv.length > 0) {
     console.error(`❌ FATAL: Missing environment variables: ${missingEnv.join(', ')}`);
@@ -32,7 +32,7 @@ const redis = new Redis({
     host: process.env.REDIS_HOST,
     port: 6379,
     retryStrategy: times => Math.min(times * 50, 2000),
-    maxRetriesPerRequest: null // 큐 대기 시 에러 방지
+    maxRetriesPerRequest: null
 });
 
 let isRedisConnected = false;
@@ -49,7 +49,23 @@ redis.on('connect', () => {
 
 app.use(express.json());
 
-// 0. 상세 헬스 체크 (로드 밸런서용)
+// [Security] 보안 미들웨어 (경비원)
+const authenticate = (req, res, next) => {
+    // 1. 헤더에서 키를 꺼낸다.
+    const clientKey = req.headers['x-api-key'];
+    const serverKey = process.env.NANOGRID_API_KEY;
+
+    // 2. 키가 없거나 틀리면 쫓아낸다.
+    if (!clientKey || clientKey !== serverKey) {
+        console.warn(`⛔ Unauthorized access attempt from ${req.ip}`);
+        return res.status(401).json({ error: "Unauthorized: Invalid or missing API Key" });
+    }
+
+    // 3. 맞으면 통과시킨다.
+    next();
+};
+
+// 0. 상세 헬스 체크 (로드 밸런서는 인증 없이 통과시켜야 함)
 app.get('/health', (req, res) => {
     const status = isRedisConnected ? 200 : 503;
     res.status(status).json({
@@ -60,7 +76,7 @@ app.get('/health', (req, res) => {
     });
 });
 
-// 1. 코드 업로드 (POST /upload)
+// 1. 코드 업로드 (POST /upload) -> 인증 필요
 const upload = multer({
     storage: multerS3({
         s3: s3,
@@ -73,13 +89,13 @@ const upload = multer({
     })
 });
 
-app.post('/upload', upload.single('file'), async (req, res) => {
+// authenticate 미들웨어를 중간에 끼워넣음
+app.post('/upload', authenticate, upload.single('file'), async (req, res) => {
     try {
         if (!req.file) {
             return res.status(400).json({ error: "File upload failed or no file provided" });
         }
 
-        // [안전장치] 빈 값 방어 함수
         const safeString = (val, defaultVal) => {
             if (val === undefined || val === null) return defaultVal;
             const str = String(val).trim();
@@ -88,9 +104,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
 
         const body = req.body || {};
         
-        // 데이터 정제
         const functionId = safeString(req.functionId, uuidv4());
-        // req.file.key가 없을 때를 대비해 수동 경로 생성
         const fallbackKey = `functions/${functionId}/v1.zip`;
         const s3Key = safeString(req.file.key, fallbackKey);
         
@@ -107,7 +121,6 @@ app.post('/upload', upload.single('file'), async (req, res) => {
             uploadedAt: { S: new Date().toISOString() }
         };
 
-        // [DEBUG] DB 저장 데이터 로그
         console.log("👉 DB Save Item:", JSON.stringify(itemToSave, null, 2));
 
         await db.send(new PutItemCommand({
@@ -124,8 +137,9 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     }
 });
 
-// 2. 함수 실행 (POST /run)
-app.post('/run', async (req, res) => {
+// 2. 함수 실행 (POST /run) -> 인증 필요
+// authenticate 미들웨어를 중간에 끼워넣음
+app.post('/run', authenticate, async (req, res) => {
     const { functionId, inputData } = req.body || {};
     
     if (!functionId) {
@@ -170,11 +184,10 @@ app.post('/run', async (req, res) => {
 
 function waitForResult(requestId) {
     return new Promise((resolve, reject) => {
-        // 결과 구독용으로 별도 커넥션 생성 (블로킹 방지)
         const sub = new Redis({ 
             host: process.env.REDIS_HOST, 
             port: 6379,
-            retryStrategy: null // 구독용은 재시도보다 빠른 실패가 나을 수 있음 (선택사항)
+            retryStrategy: null 
         });
         
         const channel = `result:${requestId}`;
@@ -211,13 +224,12 @@ function waitForResult(requestId) {
     });
 }
 
-// Server Start & Graceful Shutdown
 const server = app.listen(PORT, () => {
     console.log(`🚀 NanoGrid Controller ${VERSION} Started on port ${PORT}`);
+    console.log(`   🔒 Security Level: High (API Key Required)`);
     console.log(`   - Mode: EC2 Native (No Lambda)`);
 });
 
-// 프로세스 종료 시그널 처리 (Ctrl+C, PM2 stop 등)
 const gracefulShutdown = () => {
     console.log('Received kill signal, shutting down gracefully');
     server.close(() => {
@@ -226,7 +238,6 @@ const gracefulShutdown = () => {
         process.exit(0);
     });
 
-    // 강제 종료 (10초 후)
     setTimeout(() => {
         console.error('Could not close connections in time, forcefully shutting down');
         process.exit(1);
