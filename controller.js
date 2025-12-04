@@ -10,6 +10,15 @@ const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 const PORT = 8080;
+const VERSION = "v1.2 (Production Ready)";
+
+// [Init] 필수 환경변수 검증
+const REQUIRED_ENV = ['AWS_REGION', 'BUCKET_NAME', 'TABLE_NAME', 'SQS_URL', 'REDIS_HOST'];
+const missingEnv = REQUIRED_ENV.filter(key => !process.env[key]);
+if (missingEnv.length > 0) {
+    console.error(`❌ FATAL: Missing environment variables: ${missingEnv.join(', ')}`);
+    process.exit(1);
+}
 
 // AWS Clients
 const s3 = new S3Client({ region: process.env.AWS_REGION });
@@ -22,21 +31,33 @@ console.log("👉 [DEBUG] REDIS_HOST:", process.env.REDIS_HOST);
 const redis = new Redis({
     host: process.env.REDIS_HOST,
     port: 6379,
-    retryStrategy: times => Math.min(times * 50, 2000)
+    retryStrategy: times => Math.min(times * 50, 2000),
+    maxRetriesPerRequest: null // 큐 대기 시 에러 방지
 });
 
+let isRedisConnected = false;
+
 redis.on('error', (err) => {
-    console.error("❌ Global Redis Error (무시됨):", err.message);
+    isRedisConnected = false;
+    console.error("❌ Global Redis Error (Reconnecting...):", err.message);
 });
 
 redis.on('connect', () => {
+    isRedisConnected = true;
     console.log("✅ Global Redis Connected!");
 });
 
 app.use(express.json());
 
+// 0. 상세 헬스 체크 (로드 밸런서용)
 app.get('/health', (req, res) => {
-    res.status(200).send('OK');
+    const status = isRedisConnected ? 200 : 503;
+    res.status(status).json({
+        status: isRedisConnected ? 'OK' : 'ERROR',
+        redis: isRedisConnected,
+        version: VERSION,
+        uptime: process.uptime()
+    });
 });
 
 // 1. 코드 업로드 (POST /upload)
@@ -86,12 +107,8 @@ app.post('/upload', upload.single('file'), async (req, res) => {
             uploadedAt: { S: new Date().toISOString() }
         };
 
-        // [DEBUG] DB 저장 데이터 로그 (에러 발생 시 이 로그를 확인하세요)
+        // [DEBUG] DB 저장 데이터 로그
         console.log("👉 DB Save Item:", JSON.stringify(itemToSave, null, 2));
-
-        if (!process.env.TABLE_NAME) {
-            throw new Error("TABLE_NAME is not defined in .env");
-        }
 
         await db.send(new PutItemCommand({
             TableName: process.env.TABLE_NAME,
@@ -153,7 +170,13 @@ app.post('/run', async (req, res) => {
 
 function waitForResult(requestId) {
     return new Promise((resolve, reject) => {
-        const sub = new Redis({ host: process.env.REDIS_HOST, port: 6379 });
+        // 결과 구독용으로 별도 커넥션 생성 (블로킹 방지)
+        const sub = new Redis({ 
+            host: process.env.REDIS_HOST, 
+            port: 6379,
+            retryStrategy: null // 구독용은 재시도보다 빠른 실패가 나을 수 있음 (선택사항)
+        });
+        
         const channel = `result:${requestId}`;
         let completed = false;
 
@@ -167,10 +190,18 @@ function waitForResult(requestId) {
         function cleanup() {
             completed = true;
             clearTimeout(timeout);
-            sub.disconnect();
+            try {
+                sub.disconnect();
+            } catch (e) { /* ignore */ }
         }
 
-        sub.subscribe(channel);
+        sub.subscribe(channel, (err) => {
+            if (err) {
+                cleanup();
+                resolve({ status: "ERROR", message: "Redis subscribe failed" });
+            }
+        });
+
         sub.on('message', (chn, msg) => {
             if (chn === channel) {
                 cleanup();
@@ -180,8 +211,27 @@ function waitForResult(requestId) {
     });
 }
 
-app.listen(PORT, () => {
-    // 👇 이 로그가 안 보이면 재시작이 안 된 것입니다.
-    console.log(`🚀 NanoGrid Controller v1.1 Started on port ${PORT}`);
+// Server Start & Graceful Shutdown
+const server = app.listen(PORT, () => {
+    console.log(`🚀 NanoGrid Controller ${VERSION} Started on port ${PORT}`);
     console.log(`   - Mode: EC2 Native (No Lambda)`);
 });
+
+// 프로세스 종료 시그널 처리 (Ctrl+C, PM2 stop 등)
+const gracefulShutdown = () => {
+    console.log('Received kill signal, shutting down gracefully');
+    server.close(() => {
+        console.log('Closed out remaining connections');
+        redis.quit();
+        process.exit(0);
+    });
+
+    // 강제 종료 (10초 후)
+    setTimeout(() => {
+        console.error('Could not close connections in time, forcefully shutting down');
+        process.exit(1);
+    }, 10000);
+};
+
+process.on('SIGTERM', gracefulShutdown);
+process.on('SIGINT', gracefulShutdown);
