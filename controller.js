@@ -129,6 +129,13 @@ app.get('/health', (req, res) => {
 app.post('/upload', authenticate, rateLimiter, upload.single('file'), async (req, res) => {
     try {
         if (!req.file) return res.status(400).json({ error: "No file provided" });
+
+        // Input Validation
+        const memoryMb = parseInt(req.body.memoryMb || "128");
+        if (isNaN(memoryMb) || memoryMb < 128 || memoryMb > 10240) {
+            return res.status(400).json({ error: "Invalid memoryMb. Must be between 128 and 10240." });
+        }
+
         const functionId = req.functionId || uuidv4();
 
         await db.send(new PutItemCommand({
@@ -138,7 +145,7 @@ app.post('/upload', authenticate, rateLimiter, upload.single('file'), async (req
                 s3Key: { S: req.file.key },
                 originalName: { S: req.file.originalname },
                 runtime: { S: req.body.runtime || "python" },
-                memoryMb: { N: (req.body.memoryMb || "128").toString() }, // Auto-Tuner
+                memoryMb: { N: memoryMb.toString() }, // Auto-Tuner
                 uploadedAt: { S: new Date().toISOString() }
             }
         }));
@@ -374,9 +381,28 @@ app.delete(['/functions/:id', '/api/functions/:id'], cors(), async (req, res) =>
     }
 });
 
+// Global Error Handler
+app.use((err, req, res, next) => {
+    logger.error("Global Error Handler", err);
+    res.status(500).json({ error: "Internal Server Error" });
+});
+
 const server = app.listen(PORT, () => {
     logger.info(`NanoGrid Controller ${VERSION} Started`, { port: PORT });
 });
 server.setTimeout(300000); // Socket Timeout: 5 min
 
-process.on('SIGTERM', () => { server.close(() => process.exit(0)); });
+process.on('SIGTERM', () => {
+    logger.info("SIGTERM received. Starting graceful shutdown...");
+    server.close(() => {
+        logger.info("HTTP Server Closed");
+        // Disconnect Redis clients
+        Promise.all([
+            redis.quit().catch(err => logger.error("Error closing Redis", err)),
+            redisSub.quit().catch(err => logger.error("Error closing RedisSub", err))
+        ]).finally(() => {
+            logger.info("Resource cleanup finished. Exiting.");
+            process.exit(0);
+        });
+    });
+});
