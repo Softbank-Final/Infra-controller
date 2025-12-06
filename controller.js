@@ -160,6 +160,39 @@ app.get('/metrics', async (req, res) => {
 });
 
 
+// 0.2 Model Catalog (Proxy to AI Node)
+app.get('/models', async (req, res) => {
+    try {
+        const aiNodeUrl = process.env.AI_NODE_URL || 'http://10.0.20.100:11434';
+        // Resilience: Timeout
+        const timeoutMs = parseInt(process.env.AI_NODE_TIMEOUT || "2000");
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+        const response = await fetch(`${aiNodeUrl}/api/tags`, { signal: controller.signal });
+        clearTimeout(timeout);
+        if (!response.ok) throw new Error(`AI Node returned ${response.status}`);
+
+        const data = await response.json();
+        const models = data.models.map(m => ({
+            id: m.name,
+            name: m.name,
+            size: m.size,
+            details: m.details,
+            status: 'available'
+        }));
+
+        res.json({ models });
+    } catch (error) {
+        logger.error("Model Catalog Error", { error: error.message });
+        // Fallback for reliability (Cold Start prevention logic in client mostly, but here just info)
+        res.json({
+            models: [{ id: 'llama3:8b', name: 'llama3:8b (Default)', status: 'fallback', details: {} }],
+            warning: "Could not fetch dynamic model list from AI Node. showing default."
+        });
+    }
+});
+
 // 1. Upload
 app.post('/upload', authenticate, rateLimiter, upload.single('file'), async (req, res) => {
     try {
@@ -194,12 +227,12 @@ app.post('/upload', authenticate, rateLimiter, upload.single('file'), async (req
 
 // 2. Run
 app.post('/run', authenticate, rateLimiter, async (req, res) => {
-    const { functionId, inputData } = req.body || {};
+    const { functionId, inputData, modelId } = req.body || {};
     const isAsync = req.headers['x-async'] === 'true';
     if (!functionId) return res.status(400).json({ error: "functionId is required" });
 
     const requestId = uuidv4();
-    logger.info(`Run Request`, { requestId, functionId, mode: isAsync ? 'ASYNC' : 'SYNC' });
+    logger.info(`Run Request`, { requestId, functionId, modelId, mode: isAsync ? 'ASYNC' : 'SYNC' });
 
     try {
         const { Item } = await db.send(new GetItemCommand({
@@ -215,7 +248,8 @@ app.post('/run', authenticate, rateLimiter, async (req, res) => {
             s3Bucket: process.env.BUCKET_NAME,
             s3Key: Item.s3Key ? Item.s3Key.S : "",
             timeoutMs: 300000, // Worker Timeout: 5 min
-            input: inputData || {}
+            input: inputData || {},
+            modelId: modelId || "llama3:8b" // Dynamic Model Selection
         };
 
         await sqs.send(new SendMessageCommand({
